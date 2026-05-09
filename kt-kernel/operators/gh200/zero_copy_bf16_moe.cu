@@ -160,6 +160,13 @@ uintptr_t gh200_register_mapped_host(uintptr_t host_ptr, size_t bytes, bool read
 #endif
 
   cudaError_t err = cudaHostRegister(reinterpret_cast<void*>(range.base), range.bytes, flags);
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11020
+  if (err == cudaErrorNotSupported && (flags & cudaHostRegisterReadOnly)) {
+    (void)cudaGetLastError();
+    flags &= ~cudaHostRegisterReadOnly;
+    err = cudaHostRegister(reinterpret_cast<void*>(range.base), range.bytes, flags);
+  }
+#endif
   if (err == cudaErrorHostMemoryAlreadyRegistered) {
     (void)cudaGetLastError();
   } else {
