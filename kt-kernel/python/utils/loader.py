@@ -736,6 +736,7 @@ class BF16SafeTensorLoader(SafeTensorLoader):
     MOE_FORMATS = {
         "deepseek": ("{base}.mlp.experts", "gate_proj", "up_proj", "down_proj"),
         "mixtral": ("{base}.block_sparse_moe.experts", "w1", "w3", "w2"),
+        "mistral": ("{base}.experts", "w1", "w3", "w2"),
     }
 
     def __init__(self, file_path: str):
@@ -746,6 +747,12 @@ class BF16SafeTensorLoader(SafeTensorLoader):
     def _detect_format(self):
         """Auto-detect the MoE naming format by checking tensor keys."""
         sample_keys = list(self.tensor_file_map.keys())[:1000]
+
+        for key in sample_keys:
+            if key.endswith(".mlp.experts.gate_up_proj") or key.endswith(".mlp.experts.gate_up_proj.weight"):
+                self._detected_format = "packed"
+                print("[BF16SafeTensorLoader] Detected format: packed")
+                return
 
         for fmt_name, (path_tpl, gate, up, down) in self.MOE_FORMATS.items():
             for key in sample_keys:
@@ -758,14 +765,27 @@ class BF16SafeTensorLoader(SafeTensorLoader):
                         self._detected_format = fmt_name
                         print(f"[BF16SafeTensorLoader] Detected format: {fmt_name}")
                         return
+                    elif fmt_name == "mistral" and ".mlp.experts" not in key and ".block_sparse_moe.experts" not in key:
+                        self._detected_format = fmt_name
+                        print(f"[BF16SafeTensorLoader] Detected format: {fmt_name}")
+                        return
 
         self._detected_format = "deepseek"
         print("[BF16SafeTensorLoader] No MoE format detected, defaulting to: deepseek")
 
-    def _get_experts_prefix(self, base_key: str) -> str:
-        """Get the experts prefix based on detected format."""
+    def _get_experts_prefix_candidates(self, base_key: str) -> list[str]:
+        """Get expert-prefix candidates based on detected format and common base variants."""
         path_tpl, _, _, _ = self.MOE_FORMATS[self._detected_format]
-        return path_tpl.format(base=base_key)
+        candidates = [path_tpl.format(base=base_key)]
+
+        if base_key.startswith("model."):
+            candidates.append(path_tpl.format(base=base_key[len("model.") :]))
+
+        parts = base_key.split(".", 1)
+        if len(parts) == 2:
+            candidates.append(path_tpl.format(base=f"{parts[0]}.language_model.{parts[1]}"))
+
+        return list(dict.fromkeys(candidates))
 
     def _get_proj_names(self):
         """Get projection names (gate, up, down) based on detected format."""
@@ -795,15 +815,24 @@ class BF16SafeTensorLoader(SafeTensorLoader):
             Dictionary with keys: gate, up, down, gate_scale (None), up_scale (None), down_scale (None)
             gate/up/down: list of tensors [expert_id] -> tensor
         """
-        experts_prefix = self._get_experts_prefix(base_key)
+        if self._detected_format == "packed":
+            return self._load_experts_packed(base_key, device)
+
+        experts_prefix_candidates = self._get_experts_prefix_candidates(base_key)
         gate_name, up_name, down_name = self._get_proj_names()
 
         expert_count = 0
-        while self.has_tensor(f"{experts_prefix}.{expert_count}.{gate_name}.weight"):
-            expert_count += 1
+        experts_prefix = None
+        for prefix in experts_prefix_candidates:
+            expert_count = 0
+            while self.has_tensor(f"{prefix}.{expert_count}.{gate_name}.weight"):
+                expert_count += 1
+            if expert_count > 0:
+                experts_prefix = prefix
+                break
 
-        if expert_count == 0:
-            raise ValueError(f"No experts found for key {experts_prefix}")
+        if expert_count == 0 or experts_prefix is None:
+            raise ValueError(f"No experts found for keys: {experts_prefix_candidates}")
 
         gate_weights = [None] * expert_count
         up_weights = [None] * expert_count
@@ -822,6 +851,42 @@ class BF16SafeTensorLoader(SafeTensorLoader):
             "gate": gate_weights,
             "up": up_weights,
             "down": down_weights,
+            "gate_scale": None,
+            "up_scale": None,
+            "down_scale": None,
+        }
+
+    def _resolve_packed_experts_prefix(self, base_key: str) -> tuple[str, str]:
+        """Resolve packed expert prefix and whether tensors use a .weight suffix."""
+        candidates = [f"{base_key}.mlp.experts"]
+        parts = base_key.split(".", 1)
+        if len(parts) == 2:
+            candidates.append(f"{parts[0]}.language_model.{parts[1]}.mlp.experts")
+
+        for experts_prefix in list(dict.fromkeys(candidates)):
+            if self.has_tensor(f"{experts_prefix}.gate_up_proj"):
+                return experts_prefix, ""
+            if self.has_tensor(f"{experts_prefix}.gate_up_proj.weight"):
+                return experts_prefix, ".weight"
+
+        raise ValueError(f"No packed experts found for base_key '{base_key}'.")
+
+    def _load_experts_packed(self, base_key: str, device: str = "cpu"):
+        """Load packed BF16 experts: gate/up are stored together as [E, 2*I, H]."""
+        experts_prefix, suffix = self._resolve_packed_experts_prefix(base_key)
+
+        gate_up = self.load_tensor(f"{experts_prefix}.gate_up_proj{suffix}", device)
+        down = self.load_tensor(f"{experts_prefix}.down_proj{suffix}", device)
+
+        mid = gate_up.shape[1] // 2
+        gate_list = [gate_up[i, :mid, :].contiguous() for i in range(gate_up.shape[0])]
+        up_list = [gate_up[i, mid:, :].contiguous() for i in range(gate_up.shape[0])]
+        down_list = [down[i].contiguous() for i in range(down.shape[0])]
+
+        return {
+            "gate": gate_list,
+            "up": up_list,
+            "down": down_list,
             "gate_scale": None,
             "up_scale": None,
             "down_scale": None,

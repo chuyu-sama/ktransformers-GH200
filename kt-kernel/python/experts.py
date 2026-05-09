@@ -18,6 +18,7 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import torch
 from typing import List, Optional, Union
 
@@ -26,6 +27,7 @@ from .experts_base import BaseMoEWrapper, KExpertsCPUBuffer
 
 # Import inference backend implementations
 from .utils.amx import AMXMoEWrapper, NativeMoEWrapper
+from .utils.gh200_zero_copy import GH200ZeroCopyMoEWrapper
 from .utils.llamafile import LlamafileMoEWrapper
 from .utils.moe_kernel import GeneralMoEWrapper
 
@@ -311,7 +313,15 @@ def _create_inference_wrapper(
         BaseMoEWrapper instance
     """
     # Select backend based on method
-    if method in ["AMXINT4", "AMXINT8"]:
+    if method == "BF16" and os.getenv("KT_GH200_ZERO_COPY", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "enabled",
+    }:
+        backend_cls = GH200ZeroCopyMoEWrapper
+    elif method in ["AMXINT4", "AMXINT8"]:
         backend_cls = AMXMoEWrapper
     elif method in ["RAWINT4", "FP8", "BF16", "FP8_PERCHANNEL", "GPTQ_INT4", "MXFP4"]:
         backend_cls = NativeMoEWrapper

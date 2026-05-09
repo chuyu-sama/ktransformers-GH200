@@ -139,6 +139,72 @@ python -m sglang.launch_server \
 | `--record-kt-gpu-expert-distribution` | Enable recording of GPU expert distribution for analysis. |
 | `--expert-distribution-recorder-mode` | Recording mode: `stat` (default), `stat_approx`, `per_pass`, or `per_token`. |
 
+### GH200 BF16 Zero-Copy Backend
+
+GH200 can use a fully GPU-side cold expert path for BF16 routed experts. Hot experts stay in Hopper HBM through the
+existing KT/SGLang GPU expert mask, while cold experts stay in Grace LPDDR5X and are registered as mapped pinned host
+memory. The GH200 CUDA kernel reads those cold expert weights directly over C2C, so hidden states, top-k ids, and router
+weights remain on GPU and are not copied through the CPUInfer AMX/AVX path.
+
+This backend is opt-in and only affects `--kt-method BF16`:
+
+```bash
+export KT_GH200_ZERO_COPY=1
+export CUDA_VISIBLE_DEVICES=0
+
+python -m sglang.launch_server \
+    --model /path/to/Qwen3.6-35B-A3B \
+    --kt-weight-path /path/to/Qwen3.6-35B-A3B \
+    --kt-method BF16 \
+    --kt-cpuinfer 1 \
+    --kt-threadpool-count 1 \
+    --kt-num-gpu-experts 96 \
+    --kt-expert-placement-strategy uniform \
+    --kt-gpu-prefill-token-threshold 2048 \
+    --trust-remote-code
+```
+
+For Qwen3.6-35B-A3B, the first validation target is 40 MoE layers with 256 routed experts per layer and 8 routed experts
+per token. With `--kt-num-gpu-experts 96`, the validation split is 96 hot experts and 160 cold experts per layer, or
+3840 hot experts and 6400 cold experts in total. After correctness is stable, switch placement to frequency-based routing:
+
+```bash
+python -m sglang.launch_server \
+    --model /path/to/Qwen3.6-35B-A3B \
+    --kt-weight-path /path/to/Qwen3.6-35B-A3B \
+    --kt-method BF16 \
+    --kt-cpuinfer 1 \
+    --kt-threadpool-count 1 \
+    --kt-num-gpu-experts 96 \
+    --kt-expert-placement-strategy frequency \
+    --init-expert-location /path/to/activation_stats.pt \
+    --kt-enable-dynamic-expert-update \
+    --kt-gpu-prefill-token-threshold 2048 \
+    --trust-remote-code
+```
+
+The first implementation is intentionally correctness-first:
+
+| Stage | Behavior |
+|-------|----------|
+| Decode | One CUDA launch pair computes the active cold experts for the current token. Hot experts are skipped by mask and remain owned by the HBM GPU path. |
+| Prefill | Uses the same token-by-top-k computation over the prefill batch. This can reread the same cold expert weights multiple times over C2C, but keeps pointer mapping, stream ordering, and hot/cold accumulation easy to validate. |
+| Future prefill optimization | Group token positions by cold expert on GPU, stream each cold expert weight once or a few times, and scatter-add results back to token outputs. |
+
+Build on GH200 with CUDA enabled:
+
+```bash
+git pull origin main
+cd ktransformers-GH200/kt-kernel
+CPUINFER_USE_CUDA=1 CPUINFER_CUDA_ARCHS=90 pip install -v -e .
+```
+
+If registration fails, check the locked-memory limit before launching the server:
+
+```bash
+ulimit -l
+```
+
 ## Step 3: Send Inference Requests
 
 Once the server is running (default: `http://localhost:30000`), you can interact with the model in several ways:

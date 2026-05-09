@@ -23,6 +23,10 @@
 #include "cpu_backend/worker_pool.h"
 #include "operators/common.hpp"
 
+#if defined(KTRANSFORMERS_USE_CUDA)
+#include "operators/gh200/zero_copy_bf16_moe.h"
+#endif
+
 #if defined(USE_MOE_KERNEL)
 #include "operators/moe_kernel/la/kernel.hpp"
 #include "operators/moe_kernel/moe.hpp"
@@ -496,6 +500,21 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def("submit_with_cuda_stream", &CPUInfer::submit_with_cuda_stream)
 #endif
       ;
+
+  auto gh200_module = m.def_submodule("gh200");
+#if defined(KTRANSFORMERS_USE_CUDA)
+  gh200_module.def("is_available", []() { return true; });
+  gh200_module.def("register_mapped_host", &gh200_register_mapped_host, py::arg("host_ptr"), py::arg("bytes"),
+                   py::arg("read_only") = true);
+  gh200_module.def("unregister_mapped_host", &gh200_unregister_mapped_host, py::arg("host_ptr"));
+  gh200_module.def("bf16_moe_forward", &gh200_bf16_moe_forward, py::arg("hidden_ptr"), py::arg("topk_ids_ptr"),
+                   py::arg("topk_weights_ptr"), py::arg("output_ptr"), py::arg("act_tmp_ptr"),
+                   py::arg("gate_ptrs_ptr"), py::arg("up_ptrs_ptr"), py::arg("down_ptrs_ptr"),
+                   py::arg("gpu_experts_mask_ptr"), py::arg("batch_size"), py::arg("expert_num"),
+                   py::arg("hidden_size"), py::arg("intermediate_size"), py::arg("topk"), py::arg("stream_ptr"));
+#else
+  gh200_module.def("is_available", []() { return false; });
+#endif
 
   auto linear_module = m.def_submodule("linear");
   py::class_<LinearConfig>(linear_module, "LinearConfig")
