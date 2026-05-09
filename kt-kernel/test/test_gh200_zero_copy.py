@@ -41,7 +41,16 @@ def _reference_cold_moe(hidden, topk_ids, topk_weights, gate, up, down, gpu_mask
 
 
 @pytest.mark.skipif(not _has_gh200_cuda_backend(), reason="CUDA-enabled kt_kernel_ext.gh200 backend is unavailable")
-def test_gh200_zero_copy_bf16_matches_reference_for_mixed_mask():
+@pytest.mark.parametrize(
+    "gpu_mask",
+    [
+        torch.tensor([False, False, False, False], dtype=torch.bool),
+        torch.tensor([True, True, True, True], dtype=torch.bool),
+        torch.tensor([False, True, False, False], dtype=torch.bool),
+    ],
+    ids=["cold-only", "hot-only", "mixed"],
+)
+def test_gh200_zero_copy_bf16_matches_reference_for_masks(gpu_mask):
     from kt_kernel.utils.gh200_zero_copy import GH200ZeroCopyMoEWrapper
 
     torch.manual_seed(0)
@@ -51,7 +60,6 @@ def test_gh200_zero_copy_bf16_matches_reference_for_mixed_mask():
     intermediate_size = 4
     batch = 3
 
-    gpu_mask = torch.tensor([False, True, False, False], dtype=torch.bool)
     wrapper = GH200ZeroCopyMoEWrapper(
         layer_idx=0,
         num_experts=num_experts,
