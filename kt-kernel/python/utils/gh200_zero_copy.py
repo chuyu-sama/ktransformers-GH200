@@ -91,6 +91,18 @@ class GH200ZeroCopyMoEWrapper(BaseMoEWrapper):
         self._down_ptrs_gpu: Optional[torch.Tensor] = None
         self._act_tmp: Optional[torch.Tensor] = None
         self._act_tmp_shape: Optional[tuple[int, int, int]] = None
+        self._grouped_prefill_enabled = _truthy_env("KT_GH200_GROUPED_PREFILL", True)
+        self._grouped_prefill_min_tokens = int(os.getenv("KT_GH200_GROUPED_PREFILL_MIN_TOKENS", "2"))
+        self._output_accum: Optional[torch.Tensor] = None
+        self._output_accum_shape: Optional[tuple[int, int]] = None
+        self._route_workspace_device: Optional[torch.device] = None
+        self._route_capacity = 0
+        self._route_counts: Optional[torch.Tensor] = None
+        self._route_offsets: Optional[torch.Tensor] = None
+        self._route_cursors: Optional[torch.Tensor] = None
+        self._route_tokens: Optional[torch.Tensor] = None
+        self._route_topks: Optional[torch.Tensor] = None
+        self._route_experts: Optional[torch.Tensor] = None
         self._pending_output: Optional[torch.Tensor] = None
         self._retired_device_tables: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
@@ -203,7 +215,8 @@ class GH200ZeroCopyMoEWrapper(BaseMoEWrapper):
             f"[GH200ZeroCopyMoEWrapper Layer {self.layer_idx}] registered "
             f"gate/up/down BF16 tensors as mapped host memory; exposed "
             f"{sum(1 for ptr in self._gate_device_ptrs if ptr)} / {self.num_experts} expert pointers "
-            f"({'all' if register_all else 'cold-only'})"
+            f"({'all' if register_all else 'cold-only'})",
+            flush=True,
         )
 
     def load_weights_from_tensors(
@@ -275,6 +288,50 @@ class GH200ZeroCopyMoEWrapper(BaseMoEWrapper):
             self._act_tmp_shape = shape
         return self._act_tmp
 
+    def _ensure_grouped_workspaces(self, batch_size: int, topk: int, device: torch.device):
+        total_routes = batch_size * topk
+
+        if self._route_counts is None or self._route_workspace_device != device:
+            self._route_counts = torch.empty((self.num_experts,), dtype=torch.int32, device=device)
+            self._route_offsets = torch.empty((self.num_experts + 1,), dtype=torch.int32, device=device)
+            self._route_cursors = torch.empty((self.num_experts,), dtype=torch.int32, device=device)
+            self._route_capacity = 0
+
+        if (
+            self._route_tokens is None
+            or self._route_topks is None
+            or self._route_experts is None
+            or self._route_workspace_device != device
+            or self._route_capacity < total_routes
+        ):
+            self._route_tokens = torch.empty((total_routes,), dtype=torch.int32, device=device)
+            self._route_topks = torch.empty((total_routes,), dtype=torch.int32, device=device)
+            self._route_experts = torch.empty((total_routes,), dtype=torch.int32, device=device)
+            self._route_capacity = total_routes
+
+        output_shape = (batch_size, self.hidden_size)
+        if self._output_accum is None or self._output_accum_shape != output_shape or self._output_accum.device != device:
+            self._output_accum = torch.empty(output_shape, dtype=torch.float32, device=device)
+            self._output_accum_shape = output_shape
+
+        self._route_workspace_device = device
+        return (
+            self._output_accum,
+            self._route_counts,
+            self._route_offsets,
+            self._route_cursors,
+            self._route_tokens,
+            self._route_topks,
+            self._route_experts,
+        )
+
+    def _use_grouped_prefill(self, batch_size: int) -> bool:
+        return (
+            self._grouped_prefill_enabled
+            and batch_size >= max(2, self._grouped_prefill_min_tokens)
+            and hasattr(_gh200_ext, "bf16_moe_forward_grouped")
+        )
+
     def _stream_ptr(self, cuda_stream, device: torch.device) -> int:
         if cuda_stream is not None:
             return int(cuda_stream)
@@ -309,6 +366,42 @@ class GH200ZeroCopyMoEWrapper(BaseMoEWrapper):
         topk_ids_i64 = topk_ids.reshape(batch_size, topk).to(device=device, dtype=torch.long).contiguous()
         topk_weights_f32 = topk_weights.reshape(batch_size, topk).to(device=device, dtype=torch.float32).contiguous()
         output = torch.empty((batch_size, self.hidden_size), dtype=torch.bfloat16, device=device)
+
+        if self._use_grouped_prefill(batch_size):
+            (
+                output_accum,
+                route_counts,
+                route_offsets,
+                route_cursors,
+                route_tokens,
+                route_topks,
+                route_experts,
+            ) = self._ensure_grouped_workspaces(batch_size, topk, device)
+            _gh200_ext.bf16_moe_forward_grouped(
+                int(flat_hidden.data_ptr()),
+                int(topk_ids_i64.data_ptr()),
+                int(topk_weights_f32.data_ptr()),
+                int(output.data_ptr()),
+                int(act_tmp.data_ptr()),
+                int(output_accum.data_ptr()),
+                int(route_counts.data_ptr()),
+                int(route_offsets.data_ptr()),
+                int(route_cursors.data_ptr()),
+                int(route_tokens.data_ptr()),
+                int(route_topks.data_ptr()),
+                int(route_experts.data_ptr()),
+                int(self._gate_ptrs_gpu.data_ptr()),
+                int(self._up_ptrs_gpu.data_ptr()),
+                int(self._down_ptrs_gpu.data_ptr()),
+                int(self._gpu_experts_mask_gpu.data_ptr()),
+                int(batch_size),
+                int(self.num_experts),
+                int(self.hidden_size),
+                int(self.moe_intermediate_size),
+                int(topk),
+                self._stream_ptr(cuda_stream, device),
+            )
+            return output
 
         _gh200_ext.bf16_moe_forward(
             int(flat_hidden.data_ptr()),

@@ -512,6 +512,14 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
                    py::arg("gate_ptrs_ptr"), py::arg("up_ptrs_ptr"), py::arg("down_ptrs_ptr"),
                    py::arg("gpu_experts_mask_ptr"), py::arg("batch_size"), py::arg("expert_num"),
                    py::arg("hidden_size"), py::arg("intermediate_size"), py::arg("topk"), py::arg("stream_ptr"));
+  gh200_module.def("bf16_moe_forward_grouped", &gh200_bf16_moe_forward_grouped, py::arg("hidden_ptr"),
+                   py::arg("topk_ids_ptr"), py::arg("topk_weights_ptr"), py::arg("output_ptr"),
+                   py::arg("act_tmp_ptr"), py::arg("output_accum_ptr"), py::arg("route_counts_ptr"),
+                   py::arg("route_offsets_ptr"), py::arg("route_cursors_ptr"), py::arg("route_tokens_ptr"),
+                   py::arg("route_topks_ptr"), py::arg("route_experts_ptr"), py::arg("gate_ptrs_ptr"),
+                   py::arg("up_ptrs_ptr"), py::arg("down_ptrs_ptr"), py::arg("gpu_experts_mask_ptr"),
+                   py::arg("batch_size"), py::arg("expert_num"), py::arg("hidden_size"),
+                   py::arg("intermediate_size"), py::arg("topk"), py::arg("stream_ptr"));
 #else
   gh200_module.def("is_available", []() { return false; });
 #endif
